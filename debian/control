@@ -1,0 +1,12 @@
+Source: foodsoft-printer
+Maintainer: Patrick Gansterer <paroga@paroga.cpm>
+Section: net
+Priority: optional
+Standards-Version: 3.9.8
+Build-Depends: debhelper (>= 9), cmake, libmm-glib-dev, libsoup2.4-dev, libjson-glib-dev, libcups2-dev, valac, libusb-1.0-0-dev, ffmpeg
+
+Package: foodsoft-printer
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: printer queue for foodsoft
+ foodsoft-printer provides a daemon to print documents.
