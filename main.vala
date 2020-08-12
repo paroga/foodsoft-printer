@@ -20,28 +20,38 @@ class Job {
     public async int run() throws Error {
         send_job_state();
 
-        var message = manager.new_soup_message(@"/printer/$id", false);
-
-        message.starting.connect((t) => {
-            download_update("starting");
-        });
-
-        message.wrote_body.connect((t) => {
-            download_update("sent request");
-        });
-
-        var stream = yield manager.send_http_request(message);
-
         var chunks = new SList<Bytes>();
-        uint length = 0;
 
         for (;;) {
-            var chunk = yield stream.read_bytes_async(8192);
-            if (chunk == null || chunk.length < 1)
+            var message = manager.new_soup_message(@"/api/v1/printer/$id", false);
+
+            message.starting.connect((t) => {
+                download_update("starting");
+            });
+
+            message.wrote_body.connect((t) => {
+                download_update("sent request");
+            });
+
+            var stream = yield manager.send_http_request(message);
+            uint length = 0;
+
+            for (;;) {
+                var chunk = yield stream.read_bytes_async(8192);
+                if (chunk == null || chunk.length < 1)
+                    break;
+                chunks.append(chunk);
+                length += chunk.length;
+                download_update(@"received $length bytes");
+            }
+
+            if (message.status_code == 200 && length > 0)
                 break;
-            chunks.append(chunk);
-            length += chunk.length;
-            download_update(@"received $length bytes");
+
+            var status_code = message.status_code;
+            var reason_phrase = message.reason_phrase;
+            download_update(@"failed with HTTP $status_code $reason_phrase");
+            yield nap(5000);
         }
 
         download_update("finished");
@@ -109,9 +119,9 @@ class Job {
     }
 
     public string websocket_text() {
-        string text = @"{\"id\":$id";
+        string text = @"{\"command\":\"message\",\"identifier\":\"{\\\"channel\\\":\\\"PrinterChannel\\\"}\",\"data\":\"{\\\"id\\\":$id";
         if (job_state == -1) {
-            text += ",\"state\":\"downloading\"";
+            text += ",\\\"state\\\":\\\"downloading\\\"";
         } else {
             var state = "unknown";
             if (job_state == CUPS.IPP.JobState.PENDING)
@@ -128,15 +138,23 @@ class Job {
                 state = "aborted";
             else if (job_state == CUPS.IPP.JobState.COMPLETED)
                 state = "completed";
-            text += @",\"state\":\"$state\"";
+            text += @",\\\"state\\\":\\\"$state\\\"";
         }
         if (message != "")
-            text += @",\"message\":\"$message\"";
+            text += @",\\\"message\\\":\\\"$message\\\"";
         if (finished)
-            text += ",\"finish\":true";
-        text += "}";
+            text += ",\\\"finish\\\":true";
+        text += ",\\\"action\\\":\\\"update\\\"}\"}";
         print (@"==> $text\n");
         return text;
+    }
+
+    async void nap(uint interval, int priority = GLib.Priority.DEFAULT) {
+        GLib.Timeout.add(interval, () => {
+            nap.callback();
+            return false;
+        }, priority);
+        yield;
     }
 }
 
@@ -246,9 +264,17 @@ class Manager {
         });
     }
 
-    public Soup.Message new_soup_message(string path, bool xx = false) {
+    public Soup.Message new_soup_message(string path, bool add_origin = false) {
         var message = new Soup.Message("GET", @"$url$path");
         message.request_headers.append("Authorization", @"Bearer $token");
+        if (add_origin) {
+            MatchInfo match_info;
+            var regex = new Regex("://([0-9A-Za-z\\-\\.]+(:\\d+)?)/");
+            if (regex.match(url, 0, out match_info)) {
+                var host = match_info.fetch(1);
+                message.request_headers.append("Origin", @"https://$host");
+            }
+        }
         return message;
     }
 
@@ -274,10 +300,6 @@ class Manager {
         job.pending = true;
     }
 
-    public void send_dummy() {
-        connection.send_text("{}");
-    }
-
     void set_unfinished_jobs(SList<uint32> list) {
         foreach (var id in list) {
             if (jobs.contains(id))
@@ -292,6 +314,7 @@ class Manager {
                     cups_jobs[job_id] = job;
                 } catch (GLib.Error e) {
                     print("ERROR (Job): %s\n", e.message);
+                    jobs.remove(id);
                 }
             });
         }
@@ -312,11 +335,9 @@ class Manager {
 
     async bool connectWebSocket(Cancellable cancellable) {
         try {
-            var message = new_soup_message("/printer/socket");
+            var message = new_soup_message("/cable", true);
             connection = yield session.websocket_connect_async(message, null, null, cancellable);
             connection_state_changed(true);
-
-            send_pending_job_states();
 
             connection.message.connect((t, type, message) => {
                 try {
@@ -329,12 +350,27 @@ class Manager {
                     if (root_object.get_node_type() != Json.NodeType.OBJECT)
                       throw new Foodsoft.Error("Invalid JSON object");
 
-                    var aa = root_object.get_object().get_member("unfinished_jobs");
-                    if (aa == null || aa.get_node_type() != Json.NodeType.ARRAY)
+                    var root_object_type = root_object.get_object().get_member("type");
+                    if (root_object_type != null /* && root_object_type.get_value_type() == Type.STRING */) {
+                        var root_type = root_object_type.get_string();
+                        if (root_type == "welcome") {
+                            connection.send_text("{\"command\":\"subscribe\",\"identifier\":\"{\\\"channel\\\":\\\"PrinterChannel\\\"}\"}");
+                        } else if (root_type == "confirm_subscription")
+                            send_pending_job_states();
+                        return;
+                    }
+
+                    var root_message = root_object.get_object().get_member("message");
+                    if (root_message == null || root_message.get_node_type() != Json.NodeType.OBJECT)
+                        throw new Foodsoft.Error("Invalid JSON message");
+
+                    var unfinished_job_ids = root_message.get_object().get_member("unfinished_job_ids");
+                    if (unfinished_job_ids == null || unfinished_job_ids.get_node_type() != Json.NodeType.ARRAY)
                         throw new Foodsoft.Error("Invalid JSON array");
 
-                    var unfinisehd_jobs = aa.get_array();
-                    foreach (var item in unfinisehd_jobs.get_elements ()) {
+                    foreach (var item in unfinished_job_ids.get_array().get_elements()) {
+                        //  if (item.get_value_type() != Type.INT64)
+                        //      throw new Foodsoft.Error("Invalid JSON value");
                         list.append((uint32) item.get_int());
                     }
 
@@ -473,15 +509,12 @@ int main(string[] args) {
 
             uint32 i = 0;
             manager.foreach_job((job) => {
-                display.update_slot(i++, job.display_icon(), (uchar) (job.id % 100), job.message);
+                if (i < display_slots_count)
+                    display.update_slot(i++, job.display_icon(), (uchar) (job.id % 100), job.message);
             });
             while (i < display_slots_count)
                 display.update_slot(i++, '\0');
 
-            return true;
-        });
-        Timeout.add(5000, () => {
-            manager.send_dummy();
             return true;
         });
     } catch (GLib.Error e) {
